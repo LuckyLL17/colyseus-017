@@ -6,11 +6,12 @@
 import path from 'path';
 import { dualModeEndpoints, type Endpoint } from '@colyseus/core';
 import { safePath } from './internal/http.js';
+import { eq } from 'drizzle-orm';
 import { getTableConfig as getPgTableConfig } from 'drizzle-orm/pg-core';
 import { getTableConfig as getSqliteTableConfig } from 'drizzle-orm/sqlite-core';
 import { GameDatabase } from '@colyseus/database';
 import type { ResourceDefinition } from './catalog/define-resource.js';
-import { JWT } from '@colyseus/auth';
+import { JWT, auth as colyseusAuth, type MfaEnrollment } from '@colyseus/auth';
 import { authEndpoints } from './auth/endpoints.js';
 import { readSessionFromHeader, type SessionConfig } from './auth/sessions.js';
 import { sessionGuard } from './auth/guard.js';
@@ -181,6 +182,25 @@ export interface AdminOptions {
     bootstrap?: RateLimiter | false;
     /** Per-(ip, email) limit on /auth/request-reset. Default ~1/min. */
     requestReset?: RateLimiter | false;
+    /** Per-(ip, user) limit on /auth/mfa/verify. Default 5 attempts, ~1 per 12s. */
+    mfa?: RateLimiter | false;
+  };
+
+  /**
+   * Optional one-time MFA for operator sign-in. Enrollment itself is
+   * resolved through `@colyseus/auth`'s `auth.settings.onGetMfaEnrollment`
+   * (default: conventional `mfaSecret` / `mfaRecoveryCodes` fields on the
+   * users row) — operators without an enrollment keep the password-only
+   * flow untouched.
+   *
+   * `requiredActions` lists the audit-action tags that demand an
+   * MFA-verified session (cookie minted via `/auth/mfa/verify`). Default
+   * `['room.dispose']` — disposing a live room is the panel's most
+   * destructive one-click action. Add more (`'user.ban'`,
+   * `'user.revoke_sessions'`, …) or pass `[]` to disable the gate.
+   */
+  mfa?: {
+    requiredActions?: string[];
   };
 
   /**
@@ -417,6 +437,22 @@ function buildContext(opts: AdminOptions): EndpointContext {
   // override by passing `defineAdminResource(userNotes, {...})`.
   applyBuiltInResourceDefaults(resources, tables);
 
+  // Live MFA-enrollment lookup for the high-risk-action gate. Goes through
+  // the SAME `auth.settings.onGetMfaEnrollment` the login flow uses, fed
+  // with the users row fetched by id — so whatever convention/override the
+  // app configured applies uniformly. `null` for legacy (un-enrolled)
+  // accounts, which keeps their original flow.
+  const resolveMfaEnrollment = async (userId: string): Promise<MfaEnrollment | null> => {
+    const getEnrollment = colyseusAuth.settings.onGetMfaEnrollment;
+    if (typeof getEnrollment !== 'function') { return null; }
+    const users = tables.users;
+    if (!users) { return null; }
+    const rows = await database.drizzle.select().from(users).where(eq(users.id, userId)).limit(1);
+    const row = rows[0];
+    if (!row) { return null; }
+    return (await getEnrollment(row)) ?? null;
+  };
+
   // pg-core and sqlite-core expose getTableConfig with the same structural
   // shape. Pick once at setup based on the GameDatabase's dialect.
   const getTableConfig: (table: any) => any = database.dialect === 'pg'
@@ -427,6 +463,8 @@ function buildContext(opts: AdminOptions): EndpointContext {
     apiPath, uiPath, uiDistDir,
     database, tables, resources,
     getTableConfig, resolveUserId, enforceRbac, logger,
+    mfaRequiredActions: new Set(opts.mfa?.requiredActions ?? ['room.dispose']),
+    resolveMfaEnrollment,
   };
 }
 
@@ -465,6 +503,11 @@ function adminImpl(opts: AdminOptions) {
   const requestResetLimiter = resolveLimiter(opts.rateLimit?.requestReset, {
     capacity: 3, refillPerSec: 1 / 60, retryAfterSec: 60,
   });
+  // MFA verify: 6-digit codes are brute-forceable in principle, so this is
+  // the tightest limiter of the set — 5 tries then ~1 per 12s per (ip, user).
+  const mfaLimiter = resolveLimiter(opts.rateLimit?.mfa, {
+    capacity: 5, refillPerSec: 1 / 12, retryAfterSec: 12,
+  });
 
   // Auth endpoints (login/logout/bootstrap/me/status). Spread alongside the
   // CRUD endpoints so consumers get one map to spread into createRouter.
@@ -476,6 +519,7 @@ function adminImpl(opts: AdminOptions) {
     loginLimiter,
     bootstrapLimiter,
     requestResetLimiter,
+    mfaLimiter,
     minPasswordLength: opts.minPasswordLength ?? 8,
     onResetRequest: opts.onResetRequest,
     logger: ctx.logger,

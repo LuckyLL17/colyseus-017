@@ -6,7 +6,10 @@ import { affectedRows, type ServiceDb } from './_db.ts';
  * Audit action tags. CRUD verbs cover mutations through the admin's
  * create/update/delete endpoints; `custom` is for `_action`-style
  * handlers; `auth.*` covers admin sign-in/out/bootstrap so a stolen
- * credential trail is visible in the same log as data mutations.
+ * credential trail is visible in the same log as data mutations. The
+ * `auth.mfa_*` tags track the optional one-time MFA flow: a challenge
+ * issued after the password check, a failed factor attempt, and a
+ * recovery code being spent.
  */
 export type AuditAction =
   | 'create'
@@ -19,6 +22,9 @@ export type AuditAction =
   | 'auth.bootstrap'
   | 'auth.password_reset_requested'
   | 'auth.password_reset_completed'
+  | 'auth.mfa_challenge'
+  | 'auth.mfa_failed'
+  | 'auth.mfa_recovery_consumed'
   | 'room.kick'
   | 'room.dispose'
   | 'room.lock'

@@ -2,6 +2,7 @@ import { dualModeEndpoints, type ExpressMiddleware } from '@colyseus/core';
 import { type OAuthProviderCallback, oauth } from './oauth.ts';
 import { JWT, type JwtPayload } from './JWT.ts';
 import { Hash } from './Hash.ts';
+import type { MfaEnrollment, MfaRateLimiter } from './mfa.ts';
 
 export type MayHaveUpgradeToken = { upgradingToken?: JwtPayload };
 
@@ -18,6 +19,30 @@ export type ResetPasswordCallback = (email: string, password: string) => Promise
 export type ParseTokenCallback = (token: JwtPayload) => Promise<unknown> | unknown;
 export type GenerateTokenCallback = (userdata: unknown) => Promise<unknown>;
 export type HashPasswordCallback = (password: string) => Promise<string>;
+
+/**
+ * Return the user's MFA enrollment, or `null`/`undefined` when the account
+ * doesn't have MFA enabled (legacy accounts keep the original
+ * password-only flow). Called with the user object produced by
+ * `onFindUserByEmail`, both at login time and when the challenge is
+ * verified (so enrollment changes between the two take effect).
+ *
+ * The default implementation reads the conventional `mfaSecret` /
+ * `mfaRecoveryCodes` fields off the user record — mirroring how
+ * `user.password` is a convention. Apps storing MFA state elsewhere
+ * (separate table, vault) override this.
+ */
+export type GetMfaEnrollmentCallback = (user: unknown) =>
+  Promise<MfaEnrollment | null | undefined> | MfaEnrollment | null | undefined;
+
+/**
+ * Persist that a recovery code was consumed. Called with the user object
+ * and the code's stored hash (`sha256$<hex>`) after a successful
+ * recovery-code sign-in. When this callback is NOT configured, recovery
+ * codes are refused outright — accepting them without persisting
+ * consumption would make them silently reusable.
+ */
+export type ConsumeRecoveryCodeCallback = (user: unknown, codeHash: string) => Promise<unknown>;
 
 /**
  * Info returned by `onCheckBanned` when the user is banned. Both
@@ -57,6 +82,17 @@ export interface AuthSettings {
   onGenerateToken?: GenerateTokenCallback,
   onHashPassword?: HashPasswordCallback,
   onCheckBanned?: CheckBannedCallback,
+
+  onGetMfaEnrollment?: GetMfaEnrollmentCallback,
+  onConsumeRecoveryCode?: ConsumeRecoveryCodeCallback,
+  /**
+   * Rate limiter for `/auth/mfa/verify`. Defaults to an in-memory token
+   * bucket (5 attempts, ~1 per 12s refill) keyed by (ip, user). Pass
+   * `false` to disable, or a custom limiter for multi-node deployments.
+   */
+  mfaLimiter?: MfaRateLimiter | false,
+  /** TTL of the MFA challenge JWT in seconds. Default 300 (5 minutes). */
+  mfaChallengeTtlSeconds?: number,
 };
 
 let onFindUserByEmail: FindUserByEmailCallback = (email: string) => { throw new Error('`auth.settings.onFindUserByEmail` not implemented.'); };
@@ -64,6 +100,21 @@ let onRegisterWithEmailAndPassword: RegisterWithEmailAndPasswordCallback = () =>
 let onParseToken: ParseTokenCallback = (jwt: JwtPayload) => jwt;
 let onGenerateToken: GenerateTokenCallback = async (userdata: unknown) => await JWT.sign(userdata);
 let onHashPassword: HashPasswordCallback = async (password: string) => Hash.make(password);
+
+/**
+ * Default MFA enrollment lookup: reads the conventional `mfaSecret` /
+ * `mfaRecoveryCodes` fields off the user record. Rows without
+ * `mfaSecret` (legacy accounts) get `null` → password-only flow.
+ */
+const defaultGetMfaEnrollment: GetMfaEnrollmentCallback = (user: any) => {
+  if (!user || typeof user.mfaSecret !== 'string' || user.mfaSecret === '') {
+    return null;
+  }
+  return {
+    secret: user.mfaSecret,
+    recoveryCodes: Array.isArray(user.mfaRecoveryCodes) ? user.mfaRecoveryCodes : [],
+  };
+};
 
 export const auth = {
   /**
@@ -130,6 +181,30 @@ export const auth = {
      * fresh per-password random salt (stored inline as `<algo>$<salt>$<hash>`).
      */
     onHashPassword,
+
+    /**
+     * (Optional) MFA enrollment lookup. Default reads `mfaSecret` /
+     * `mfaRecoveryCodes` off the user record; accounts without them skip
+     * MFA entirely.
+     */
+    onGetMfaEnrollment: defaultGetMfaEnrollment,
+
+    /**
+     * (Optional) Persist recovery-code consumption. Unset by default —
+     * recovery-code sign-in is refused until this is wired.
+     */
+    onConsumeRecoveryCode: undefined as ConsumeRecoveryCodeCallback | undefined,
+
+    /**
+     * (Optional) Rate limiter for `/auth/mfa/verify`. `undefined` →
+     * in-memory token bucket; `false` → disabled.
+     */
+    mfaLimiter: undefined as MfaRateLimiter | false | undefined,
+
+    /**
+     * (Optional) MFA challenge JWT TTL in seconds. Default 300.
+     */
+    mfaChallengeTtlSeconds: undefined as number | undefined,
   } as AuthSettings,
 
   prefix: "/auth",

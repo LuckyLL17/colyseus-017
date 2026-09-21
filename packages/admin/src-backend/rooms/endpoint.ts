@@ -33,7 +33,7 @@ import { listUserSessionsLive } from '@colyseus/core/internal';
 import { POSTGRES_MAX_INTEGER } from '@colyseus/database';
 import { errorResponse, json } from '../internal/http.js';
 import { ipFromHeaders } from '../auth/rate-limit.js';
-import { guard, type EndpointContext } from '../internal/context.js';
+import { guard, mfaActionGate, type EndpointContext } from '../internal/context.js';
 
 const ROOMS_RESOURCE = 'rooms';
 
@@ -352,6 +352,11 @@ export function disposeRoomEndpoint(ctx: EndpointContext): Endpoint {
     async (reqCtx) => {
       const denied = await guard(ctx, reqCtx, 'delete', ROOMS_RESOURCE);
       if (denied) { return denied; }
+      // Disposing a live room is the panel's most destructive one-click
+      // action — it's the default entry in `mfa.requiredActions`, so
+      // MFA-enrolled operators need an MFA-verified session here.
+      const mfaDenied = await mfaActionGate(ctx, reqCtx, 'room.dispose');
+      if (mfaDenied) { return mfaDenied; }
       const { roomId } = reqCtx.params as { roomId: string };
       try {
         // `disconnect()` returns a promise that resolves once every

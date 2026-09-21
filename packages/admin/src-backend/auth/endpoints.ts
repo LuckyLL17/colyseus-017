@@ -1,5 +1,11 @@
 import { count, eq } from 'drizzle-orm';
 import { Hash, JWT, auth, readTemplate } from '@colyseus/auth';
+import {
+  MFA_CHALLENGE_TTL_SECONDS,
+  checkMfaCode,
+  signMfaChallenge,
+  verifyMfaChallenge,
+} from '@colyseus/auth';
 import { createEndpoint, type Endpoint } from '@colyseus/core';
 import type { GameDatabase } from '@colyseus/database';
 import { externalUiConfig, json, errorResponse } from '../internal/http.js';
@@ -40,6 +46,8 @@ export interface AuthEndpointsOptions {
   bootstrapLimiter?: RateLimiter;
   /** Per-(ip, email) limiter applied to `/auth/request-reset`. */
   requestResetLimiter?: RateLimiter;
+  /** Per-(ip, user) limiter applied to `/auth/mfa/verify`. */
+  mfaLimiter?: RateLimiter;
   /** Min password length for /bootstrap and /reset. Default 8. */
   minPasswordLength?: number;
   /** Hook invoked when /request-reset succeeds. Default logs the URL. */
@@ -67,6 +75,7 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
   const loginLimiter = opts.loginLimiter;
   const bootstrapLimiter = opts.bootstrapLimiter;
   const requestResetLimiter = opts.requestResetLimiter;
+  const mfaLimiter = opts.mfaLimiter;
   const minPasswordLength = opts.minPasswordLength ?? 8;
   const logger = opts.logger;
   // Resolution order: explicit admin override → shared
@@ -134,7 +143,10 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
       | 'auth.logout'
       | 'auth.bootstrap'
       | 'auth.password_reset_requested'
-      | 'auth.password_reset_completed',
+      | 'auth.password_reset_completed'
+      | 'auth.mfa_challenge'
+      | 'auth.mfa_failed'
+      | 'auth.mfa_recovery_consumed',
     userId: string | null,
     ctx: any,
     extra: Record<string, unknown>,
@@ -273,12 +285,106 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
         return errorResponse(401, 'invalid credentials');
       }
 
-      const role = await database.moderation.getRole(user.id);
       const tv = await database.auth.getTokenVersion(user.id);
+
+      // MFA branch: password is right, but the account has an enrollment.
+      // Hold the session — issue a short-lived challenge JWT instead and
+      // let `/auth/mfa/verify` complete the sign-in. Accounts without an
+      // enrollment (legacy) fall through to the direct session below.
+      const enrollment = typeof auth.settings.onGetMfaEnrollment === 'function'
+        ? await auth.settings.onGetMfaEnrollment(user)
+        : null;
+      if (enrollment?.secret) {
+        const ttl = auth.settings.mfaChallengeTtlSeconds ?? MFA_CHALLENGE_TTL_SECONDS;
+        const challenge = await signMfaChallenge({ sub: String(user.id), email: body.email, tv }, ttl);
+        await tryAuditAuth('auth.mfa_challenge', user.id, ctx, { email: body.email });
+        return json({ mfa: 'required', challenge, expiresIn: ttl });
+      }
+
+      const role = await database.moderation.getRole(user.id);
       const token = await signSession({ userId: user.id, role, tv }, session);
       await tryAuditAuth('auth.login', user.id, ctx, { email: body.email });
       return json(
         { userId: user.id, role },
+        { headers: { 'set-cookie': setSessionCookie(token, session) } },
+      );
+    }),
+
+    // POST /admin-api/auth/mfa/verify — complete the MFA challenge started
+    // by /auth/login. Body: { challenge, code } (TOTP) or
+    // { challenge, recoveryCode }. Success sets the session cookie with
+    // the `mfa: true` claim (high-risk actions key off it — see
+    // AdminOptions.mfa.requiredActions). Failure states are distinct 401
+    // `error` tags: mfa_invalid_challenge / mfa_challenge_expired /
+    // mfa_session_revoked / mfa_invalid_code / recovery_code_consumed.
+    authMfaVerify: createEndpoint(`${apiPath}/auth/mfa/verify`, { method: 'POST' }, async (ctx) => {
+      const body = (ctx.body ?? {}) as { challenge?: string; code?: string; recoveryCode?: string };
+      if (!body.challenge || (!body.code && !body.recoveryCode)) {
+        return errorResponse(400, 'challenge and code (or recoveryCode) are required');
+      }
+
+      // 1. Challenge JWT — "expired" is a distinct, client-actionable state.
+      let claims: Awaited<ReturnType<typeof verifyMfaChallenge>>;
+      try {
+        claims = await verifyMfaChallenge(body.challenge);
+      } catch (e: any) {
+        return errorResponse(401, e?.code ?? 'mfa_invalid_challenge');
+      }
+
+      // 2. Rate limit per (ip, verified subject) — a stranger spraying
+      //    garbage challenges can't burn the real user's budget.
+      if (mfaLimiter) {
+        const key = `mfa:${ipFromHeaders(ctx.getHeader)}:${claims.sub}`;
+        const blocked = await mfaLimiter.check(key);
+        if (blocked) { return blocked; }
+      }
+
+      // 3. Session revocation: the challenge captured `tv` at password
+      //    time; a bump since (reset, "log out everywhere", admin
+      //    revoke) voids it.
+      if (claims.tv !== undefined) {
+        const currentTv = await database.auth.getTokenVersion(claims.sub);
+        if (currentTv !== claims.tv) {
+          return errorResponse(401, 'mfa_session_revoked');
+        }
+      }
+
+      // 4. Re-fetch the user + current enrollment.
+      const user = await findUserByEmail(claims.email);
+      const enrollment = user && typeof auth.settings.onGetMfaEnrollment === 'function'
+        ? await auth.settings.onGetMfaEnrollment(user)
+        : null;
+      if (!user || !enrollment?.secret) {
+        return errorResponse(401, 'mfa_invalid_challenge');
+      }
+
+      // 5. Recovery codes need a persistence callback — without one the
+      //    "consumed" marker can't be stored and codes would be reusable.
+      if (body.recoveryCode && typeof auth.settings.onConsumeRecoveryCode !== 'function') {
+        return errorResponse(401, 'mfa_invalid_code');
+      }
+
+      // 6. Verify the factor. Wrong TOTP and unknown recovery code share
+      //    one error shape; a recognized-but-spent recovery code is the
+      //    single distinct state.
+      const result = checkMfaCode(enrollment, { code: body.code, recoveryCode: body.recoveryCode });
+      if (result.ok === false) {
+        await tryAuditAuth('auth.mfa_failed', user.id, ctx, { email: claims.email, reason: result.error });
+        return errorResponse(401, result.error);
+      }
+      if (result.via === 'recovery_code') {
+        await auth.settings.onConsumeRecoveryCode!(user, result.hash);
+        // Recovery-code consumption is itself a security event — it
+        // shrinks the user's remaining recovery set by one.
+        await tryAuditAuth('auth.mfa_recovery_consumed', user.id, ctx, { email: claims.email });
+      }
+
+      const role = await database.moderation.getRole(user.id);
+      const tv = await database.auth.getTokenVersion(user.id);
+      const token = await signSession({ userId: user.id, role, tv, mfa: true }, session);
+      await tryAuditAuth('auth.login', user.id, ctx, { email: claims.email, mfa: result.via });
+      return json(
+        { userId: user.id, role, mfa: result.via },
         { headers: { 'set-cookie': setSessionCookie(token, session) } },
       );
     }),

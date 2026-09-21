@@ -10,6 +10,7 @@
  * `src-backend/`.
  */
 import type { GameDatabase, Action } from '@colyseus/database';
+import type { MfaEnrollment } from '@colyseus/auth';
 import { type SQL } from 'drizzle-orm';
 import type { ResourceDefinition } from '../catalog/define-resource.js';
 import type { Logger } from './logger.js';
@@ -34,6 +35,16 @@ export interface EndpointContext {
   enforceRbac: boolean;
   /** Pino-compatible logger (or null when silenced). */
   logger: Logger | null;
+  /**
+   * Audit-action tags that require an MFA-verified session (cookie with
+   * `mfa: true`). Built from `AdminOptions.mfa.requiredActions`.
+   */
+  mfaRequiredActions: ReadonlySet<string>;
+  /**
+   * Live MFA-enrollment lookup for a user id. Returns `null` for accounts
+   * without MFA — those keep the legacy (ungated) flow.
+   */
+  resolveMfaEnrollment: (userId: string) => Promise<MfaEnrollment | null>;
 }
 
 /**
@@ -113,6 +124,45 @@ export async function requireOperator(
     return errorResponse(403, 'forbidden: the admin panel requires an operator role');
   }
   return null;
+}
+
+/**
+ * MFA gate for high-risk actions. Returns `null` when the request may
+ * proceed; a 403 `mfa_required` Response when the action is configured as
+ * MFA-required, the caller's session never completed the MFA challenge,
+ * and the operator's account HAS an enrollment (so completing MFA is
+ * possible). Accounts without an enrollment — legacy rows — pass through:
+ * there is no factor they could present, and un-enrolled accounts must
+ * keep their original (password-only) flow.
+ *
+ * Runs AFTER `guard()` in the endpoint: RBAC decides "may this role do
+ * it at all", this gate decides "is this session fresh enough for it".
+ * Enrollment is checked live (not cached in the JWT) so enabling MFA
+ * takes effect on the very next request — same philosophy as the role
+ * check in `guard()`.
+ */
+export async function mfaActionGate(
+  ctx: EndpointContext,
+  reqCtx: any,
+  action: string,
+): Promise<Response | null> {
+  if (!ctx.enforceRbac) { return null; }
+  if (!ctx.mfaRequiredActions.has(action)) { return null; }
+
+  const session = await readSessionFromHeader(reqCtx.getHeader('cookie'));
+  // No cookie session ⇒ the caller authenticated some other way (dev
+  // header, custom resolver) where MFA state doesn't exist. guard()
+  // already vetted them; don't invent a factor requirement here.
+  if (!session) { return null; }
+  if (session.mfa === true) { return null; }
+
+  const enrollment = await ctx.resolveMfaEnrollment(session.userId);
+  if (!enrollment?.secret) { return null; }
+
+  return errorResponse(
+    403,
+    'mfa_required: this action requires an MFA-verified session — sign in again and complete the MFA challenge',
+  );
 }
 
 /** Look up a table + cfg by canonical name, or return a 404 Response. */

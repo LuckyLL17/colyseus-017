@@ -1,0 +1,32 @@
+{
+	"root": true,
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab"
+	},
+	"linter": {
+		"enabled": false
+	},
+	"files": {
+		"includes": [
+			"**",
+			"!**/dist",
+			"!**/coverage",
+			"!**/build",
+			"!**/demo/electron/out",
+			"!**/.next",
+			"!**/.svelte-kit",
+			"!**/.contentlayer",
+			"!**/.turbo",
+			"!**/.nuxt",
+			"!**/.source",
+			"!**/.expo",
+			"!**/.cache",
+			"!**/dev/cloudflare/drizzle",
+			"!**/playwright-report",
+			"!**/.output",
+			"!**/.tmp"
+		]
+	}
+}

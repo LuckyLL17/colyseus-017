@@ -9,7 +9,7 @@
  * Reuses @colyseus/auth's JWT class for sign/verify (same secret rotation
  * story as the rest of the framework).
  */
-import { JWT } from '@colyseus/auth';
+import { JWT, MFA_CHALLENGE_KIND } from '@colyseus/auth';
 
 export interface AdminSession {
   /** user id from the users table */
@@ -24,6 +24,12 @@ export interface AdminSession {
    * "sign out everywhere".
    */
   tv?: number;
+  /**
+   * `true` when this session completed the MFA challenge at sign-in.
+   * High-risk actions (see `AdminOptions.mfa.requiredActions`) require
+   * it for MFA-enrolled operators. Absent on legacy sessions.
+   */
+  mfa?: boolean;
   /** standard JWT claims */
   iat?: number;
   exp?: number;
@@ -50,7 +56,7 @@ export interface SessionConfig {
 }
 
 export async function signSession(
-  payload: Pick<AdminSession, 'userId' | 'role' | 'tv'>,
+  payload: Pick<AdminSession, 'userId' | 'role' | 'tv' | 'mfa'>,
   config: SessionConfig = {},
 ): Promise<string> {
   const ttl = config.ttlSeconds ?? DEFAULT_TTL_SECONDS;
@@ -59,7 +65,12 @@ export async function signSession(
 
 export async function verifySession(token: string): Promise<AdminSession | null> {
   try {
-    return await JWT.verify<AdminSession>(token);
+    const payload = await JWT.verify<AdminSession & { kind?: string }>(token);
+    // MFA challenge JWTs are signed with the same secret but are NOT
+    // sessions — refuse them so a half-completed login can't be replayed
+    // as a signed-in cookie.
+    if ((payload as any)?.kind === MFA_CHALLENGE_KIND) { return null; }
+    return payload;
   } catch {
     return null;
   }

@@ -14,6 +14,7 @@ import {
 
 import type { OAuthProviderCallback } from './oauth.ts';
 import { Hash } from './Hash.ts';
+import { MFA_CHALLENGE_KIND } from './mfa.ts';
 
 export type {
   Request, JwtPayload, Jwt,
@@ -35,11 +36,38 @@ export { Hash, JWT, auth, };
 // convention (`process.cwd()/html` shadows the bundled templates).
 export { readTemplate, htmlTemplatePath } from './templates.ts';
 
+// Optional one-time MFA: TOTP + recovery-code primitives, the challenge
+// JWT helpers, and the verify-endpoint's rate limiter.
+export {
+  MFA_CHALLENGE_KIND,
+  MFA_CHALLENGE_TTL_SECONDS,
+  MfaChallengeError,
+  generateMfaSecret,
+  generateTotp,
+  verifyTotp,
+  generateRecoveryCodes,
+  hashRecoveryCode,
+  findRecoveryCodeEntry,
+  checkMfaCode,
+  signMfaChallenge,
+  verifyMfaChallenge,
+  createMfaRateLimiter,
+  ipFromHeaders,
+  RECOVERY_CODE_COUNT,
+  type MfaEnrollment,
+  type MfaRecoveryCodeEntry,
+  type MfaChallengeClaims,
+  type MfaCheckResult,
+  type MfaRateLimiter,
+} from './mfa.ts';
+export type { GetMfaEnrollmentCallback, ConsumeRecoveryCodeCallback } from './auth.ts';
+
 // Endpoint factories — exported so consumers can call them directly with typed
 // inputs/outputs (test-time contract assertions, custom router composition).
 export {
   userdataEndpoint,
   loginEndpoint,
+  mfaVerifyEndpoint,
   registerEndpoint,
   anonymousEndpoint,
   forgotPasswordEndpoint,
@@ -75,6 +103,10 @@ if ((Room as any).onAuth === __frameworkDefaultOnAuth) {
     if (!token) { return true; }
     try {
       const decoded = await JWT.verify<any>(token);
+      // MFA challenge tokens are NOT session tokens — they only prove the
+      // password check passed. Refuse them at the room door so a player
+      // can't skip the second factor by joining with the challenge JWT.
+      if (decoded?.kind === MFA_CHALLENGE_KIND) { return false; }
       // Optional server-side revocation gate. The JWT itself is
       // valid (good signature, not expired) but the issuer may
       // have revoked it (ban, "sign-out everywhere", forced
