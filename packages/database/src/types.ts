@@ -93,6 +93,21 @@ export type AdminAuditTableShape = Table & {
   createdAt: AnyColumn;
 };
 
+export type UserMfaTableShape = Table & {
+  userId: AnyColumn;
+  secret: AnyColumn;
+  enabledAt: AnyColumn;
+  createdAt: AnyColumn;
+  updatedAt: AnyColumn;
+};
+
+export type UserMfaRecoveryCodesTableShape = Table & {
+  userId: AnyColumn;
+  codeHash: AnyColumn;
+  consumedAt: AnyColumn;
+  createdAt: AnyColumn;
+};
+
 /** All known schema slots — used as the base type for GameDatabaseOptions['schemas']. */
 export interface SchemaSet {
   users: UsersTableShape;
@@ -104,4 +119,6 @@ export interface SchemaSet {
   roles: RolesTableShape;
   userNotes: UserNotesTableShape;
   adminAudit: AdminAuditTableShape;
+  userMfa: UserMfaTableShape;
+  userMfaRecoveryCodes: UserMfaRecoveryCodesTableShape;
 }

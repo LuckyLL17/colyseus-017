@@ -32,6 +32,13 @@ export interface EndpointContext {
   resolveUserId: (ctx: { getHeader: (k: string) => string | null }) => Promise<string | undefined> | string | undefined;
   /** When false, every endpoint skips RBAC entirely (dev only). */
   enforceRbac: boolean;
+  /**
+   * When true, the built-in high-risk actions (user ban, session
+   * revocation) require a session that completed MFA (`mfa` claim).
+   * Custom resource actions opt in individually via
+   * `ResourceAction.requiresMfa` regardless of this flag.
+   */
+  requireMfaForActions: boolean;
   /** Pino-compatible logger (or null when silenced). */
   logger: Logger | null;
 }
@@ -113,6 +120,30 @@ export async function requireOperator(
     return errorResponse(403, 'forbidden: the admin panel requires an operator role');
   }
   return null;
+}
+
+/**
+ * MFA gate for high-risk actions. Returns `null` when the request's
+ * session completed MFA (the JWT carries the `mfa` claim, set only by
+ * /auth/mfa/verify or /auth/mfa/confirm); a 403 Response otherwise.
+ *
+ * Runs AFTER `guard()` — the caller is already authenticated and
+ * role-checked; this adds "and did this specific session prove the
+ * second factor". A session revoked via tokenVersion never gets this
+ * far (the identity resolver already rejected it), so a plain claim
+ * read is sufficient here.
+ */
+export async function requireMfa(
+  ctx: EndpointContext,
+  reqCtx: any,
+): Promise<Response | null> {
+  const session = await readSessionFromHeader(reqCtx.getHeader('cookie'));
+  if (session?.mfa === true) { return null; }
+  return errorResponse(
+    403,
+    'mfa_required: this action requires a session that completed MFA — ' +
+    'sign in again and finish the one-time challenge',
+  );
 }
 
 /** Look up a table + cfg by canonical name, or return a 404 Response. */

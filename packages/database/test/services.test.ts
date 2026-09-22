@@ -77,7 +77,7 @@ for (const backend of BACKENDS) {
         assert.ok(db.drizzle, 'drizzle client should be set');
         assert.ok(db.tables, 'tables map should be set');
         const expected = ['users', 'configs', 'cloudSaves', 'leaderboards', 'leaderboardEntries',
-          'analyticsEvents', 'roles', 'userNotes', 'adminAudit'];
+          'analyticsEvents', 'roles', 'userNotes', 'adminAudit', 'userMfa', 'userMfaRecoveryCodes'];
         for (const name of expected) {
           assert.ok(db.tables[name], `tables.${name} should be defined`);
         }
@@ -85,6 +85,7 @@ for (const backend of BACKENDS) {
 
       it('exposes one service instance per feature', () => {
         assert.ok(db.auth);
+        assert.ok(db.mfa);
         assert.ok(db.configs);
         assert.ok(db.saves);
         assert.ok(db.leaderboards);

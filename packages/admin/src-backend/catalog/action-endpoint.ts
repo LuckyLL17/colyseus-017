@@ -7,7 +7,7 @@
 import { createEndpoint, type Endpoint } from '@colyseus/core';
 import { sqlKeyedProjection, tryAudit } from '../internal/helpers.js';
 import { errorResponse, json } from '../internal/http.js';
-import { pkOrError, tableOrError, type EndpointContext } from '../internal/context.js';
+import { pkOrError, requireMfa, tableOrError, type EndpointContext } from '../internal/context.js';
 
 export function actionEndpoint(ctx: EndpointContext): Endpoint {
   return createEndpoint(
@@ -28,6 +28,14 @@ export function actionEndpoint(ctx: EndpointContext): Endpoint {
             return errorResponse(403, `forbidden: action '${actionName}' on '${resource}'`);
           }
         }
+      }
+
+      // Per-action MFA gate — high-risk custom actions (payouts, bulk
+      // deletes) declare `requiresMfa: true` so a stolen session cookie
+      // alone can't run them.
+      if (found.requiresMfa) {
+        const mfaDenied = await requireMfa(ctx, reqCtx);
+        if (mfaDenied) { return mfaDenied; }
       }
 
       let row: any = null;

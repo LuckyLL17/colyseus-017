@@ -1,5 +1,13 @@
 import { count, eq } from 'drizzle-orm';
-import { Hash, JWT, auth, readTemplate } from '@colyseus/auth';
+import {
+  Hash, JWT, auth, readTemplate,
+  MFA_CHALLENGE_TTL_SECONDS,
+  mfaChallengeLimiter,
+  signMfaChallenge,
+  totpUri,
+  verifyMfaChallenge,
+  verifyTOTP,
+} from '@colyseus/auth';
 import { createEndpoint, type Endpoint } from '@colyseus/core';
 import type { GameDatabase } from '@colyseus/database';
 import { externalUiConfig, json, errorResponse } from '../internal/http.js';
@@ -40,6 +48,8 @@ export interface AuthEndpointsOptions {
   bootstrapLimiter?: RateLimiter;
   /** Per-(ip, email) limiter applied to `/auth/request-reset`. */
   requestResetLimiter?: RateLimiter;
+  /** Per-ip limiter applied to `/auth/mfa/verify`. */
+  mfaLimiter?: RateLimiter;
   /** Min password length for /bootstrap and /reset. Default 8. */
   minPasswordLength?: number;
   /** Hook invoked when /request-reset succeeds. Default logs the URL. */
@@ -67,6 +77,7 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
   const loginLimiter = opts.loginLimiter;
   const bootstrapLimiter = opts.bootstrapLimiter;
   const requestResetLimiter = opts.requestResetLimiter;
+  const mfaLimiter = opts.mfaLimiter;
   const minPasswordLength = opts.minPasswordLength ?? 8;
   const logger = opts.logger;
   // Resolution order: explicit admin override → shared
@@ -134,7 +145,13 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
       | 'auth.logout'
       | 'auth.bootstrap'
       | 'auth.password_reset_requested'
-      | 'auth.password_reset_completed',
+      | 'auth.password_reset_completed'
+      | 'auth.mfa_challenge'
+      | 'auth.mfa_completed'
+      | 'auth.mfa_failed'
+      | 'auth.mfa_enrolled'
+      | 'auth.mfa_disabled'
+      | 'auth.mfa_recovery_used',
     userId: string | null,
     ctx: any,
     extra: Record<string, unknown>,
@@ -169,6 +186,30 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
     return database.auth.settings.onFindUserByEmail!(email);
   }
 
+  /**
+   * The MFA service is present on every GameDatabase-booted instance, but
+   * duck-typed/custom databases may lack it — the MFA endpoints answer
+   * 501 there instead of crashing, and login simply skips the challenge.
+   */
+  function mfaUnavailable(): Response {
+    return errorResponse(501, 'MFA is not available on this deployment (database.mfa missing)');
+  }
+
+  /**
+   * Is MFA enforced for this account? Errors (e.g. migration not applied
+   * yet) resolve to `false` — a broken MFA store must not lock every
+   * operator out of the panel. The downgrade is logged so it's visible.
+   */
+  async function isMfaEnabled(userId: string): Promise<boolean> {
+    if (!database.mfa) { return false; }
+    try {
+      return await database.mfa.isEnabled(userId);
+    } catch (err) {
+      logger?.warn?.({ err, userId }, '[admin] MFA status check failed — continuing without MFA');
+      return false;
+    }
+  }
+
   async function hashPassword(plain: string): Promise<string> {
     return Hash.make(plain);
   }
@@ -191,7 +232,7 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
     authMe: createEndpoint(`${apiPath}/auth/me`, { method: 'GET' }, async (ctx) => {
       const me = await currentSession(ctx);
       if (!me) { return errorResponse(401, 'not authenticated'); }
-      return json({ userId: me.userId, role: me.role });
+      return json({ userId: me.userId, role: me.role, mfa: me.mfa === true });
     }),
 
     // POST /admin-api/auth/bootstrap — first-run admin creation.
@@ -273,6 +314,21 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
         return errorResponse(401, 'invalid credentials');
       }
 
+      // MFA fork: the password is valid, but an enrolled account doesn't
+      // get a session yet — it gets a short-lived challenge token to
+      // complete at /auth/mfa/verify (the "password ok, challenge
+      // pending" login state). Accounts without an enrollment fall
+      // through to the legacy session issue below.
+      if (await isMfaEnabled(user.id)) {
+        const tv = await database.auth.getTokenVersion(user.id);
+        const mfaToken = await signMfaChallenge({ id: user.id, email: body.email, tv });
+        await tryAuditAuth('auth.mfa_challenge', user.id, ctx, { email: body.email });
+        return json(
+          { error: 'mfa_required', mfaToken, expiresIn: MFA_CHALLENGE_TTL_SECONDS },
+          { status: 401 },
+        );
+      }
+
       const role = await database.moderation.getRole(user.id);
       const tv = await database.auth.getTokenVersion(user.id);
       const token = await signSession({ userId: user.id, role, tv }, session);
@@ -311,6 +367,198 @@ export function authEndpoints(opts: AuthEndpointsOptions): Record<string, Endpoi
           { ok: true },
           { headers: { 'set-cookie': clearSessionCookie(session) } },
         );
+      },
+    ),
+
+    // POST /admin-api/auth/mfa/verify — complete the login challenge.
+    // Body: { token, code } where `code` is the 6-digit authenticator
+    // code or a recovery code. On success the session cookie carries the
+    // `mfa` claim, which high-risk actions can require. Failure states
+    // mirror @colyseus/auth's /auth/mfa/verify contract:
+    //   mfa_challenge_expired / invalid_challenge / session_revoked /
+    //   invalid_code / recovery_code_consumed / 429 too_many_attempts.
+    authMfaVerify: createEndpoint(
+      `${apiPath}/auth/mfa/verify`, { method: 'POST' },
+      async (ctx) => {
+        if (!database.mfa) { return mfaUnavailable(); }
+        const body = (ctx.body ?? {}) as { token?: string; code?: string };
+        if (!body.token || !body.code) {
+          return errorResponse(400, 'token and code are required');
+        }
+
+        if (mfaLimiter) {
+          const blocked = await mfaLimiter.check(`mfa:${ipFromHeaders(ctx.getHeader)}`);
+          if (blocked) { return blocked; }
+        }
+
+        const verification = await verifyMfaChallenge(body.token);
+        if (verification.status === 'expired') { return errorResponse(401, 'mfa_challenge_expired'); }
+        if (verification.status !== 'ok') { return errorResponse(401, 'invalid_challenge'); }
+        const { claims } = verification;
+
+        // Single-use + per-challenge attempt cap (shared with the
+        // player-facing endpoint via @colyseus/auth's limiter).
+        const limit = mfaChallengeLimiter.check(claims.jti, (claims.exp ?? 0) * 1000);
+        if (limit === 'used') { return errorResponse(401, 'invalid_challenge'); }
+        if (limit === 'too_many_attempts') { return errorResponse(429, 'too_many_attempts'); }
+
+        // "Session revoked" — tokenVersion moved since the challenge was
+        // issued (password reset, logout-everywhere, ban).
+        if (claims.tv !== undefined) {
+          const currentTv = await database.auth.getTokenVersion(claims.id);
+          if (currentTv !== claims.tv) { return errorResponse(401, 'session_revoked'); }
+        }
+
+        const fail = async (error: string, status = 401): Promise<Response> => {
+          mfaChallengeLimiter.recordFailure(claims.jti);
+          await tryAuditAuth('auth.mfa_failed', claims.id, ctx, { error });
+          return errorResponse(status, error);
+        };
+
+        const user = await findUserByEmail(claims.email);
+        if (!user) { return fail('invalid_challenge'); }
+
+        let record: { secret: string; enabledAt: Date | null } | null = null;
+        try {
+          record = await database.mfa.getRecord(user.id);
+        } catch (err) {
+          logger?.warn?.({ err }, '[admin] MFA record lookup failed during verify');
+          return errorResponse(503, 'mfa_unavailable');
+        }
+
+        // MFA was disabled between challenge and verify — the password
+        // check already passed, so complete the sign-in without a factor.
+        if (!record?.enabledAt) {
+          const role = await database.moderation.getRole(user.id);
+          const tv = await database.auth.getTokenVersion(user.id);
+          const token = await signSession({ userId: user.id, role, tv }, session);
+          await tryAuditAuth('auth.login', user.id, ctx, { email: claims.email, mfaSkipped: true });
+          return json(
+            { userId: user.id, role },
+            { headers: { 'set-cookie': setSessionCookie(token, session) } },
+          );
+        }
+
+        // Route by code shape: 6 digits → TOTP; anything else → recovery.
+        let method: 'totp' | 'recovery';
+        const code = body.code.trim();
+        if (/^\d{6}$/.test(code)) {
+          if (!verifyTOTP(record.secret, code)) { return fail('invalid_code'); }
+          method = 'totp';
+        } else {
+          let status: 'ok' | 'already_consumed' | 'invalid';
+          try {
+            status = await database.mfa.consumeRecoveryCode(user.id, code);
+          } catch (err) {
+            logger?.warn?.({ err }, '[admin] recovery-code consume failed');
+            return errorResponse(503, 'mfa_unavailable');
+          }
+          if (status === 'already_consumed') { return fail('recovery_code_consumed'); }
+          if (status !== 'ok') { return fail('invalid_code'); }
+          method = 'recovery';
+        }
+
+        mfaChallengeLimiter.consume(claims.jti);
+        const role = await database.moderation.getRole(user.id);
+        const tv = await database.auth.getTokenVersion(user.id);
+        const token = await signSession({ userId: user.id, role, tv, mfa: true }, session);
+        await tryAuditAuth('auth.mfa_completed', user.id, ctx, { method });
+        if (method === 'recovery') {
+          // Recovery-code logins are a high-value forensic signal (the
+          // user may have lost their factor — or someone else found a
+          // code), so they get a dedicated audit row on top of the
+          // generic completion.
+          await tryAuditAuth('auth.mfa_recovery_used', user.id, ctx, {});
+        }
+        return json(
+          { userId: user.id, role, mfa: true },
+          { headers: { 'set-cookie': setSessionCookie(token, session) } },
+        );
+      },
+    ),
+
+    // POST /admin-api/auth/mfa/enroll — begin (or restart) TOTP enrollment
+    // for the signed-in operator. Returns the secret + otpauth:// URI for
+    // QR/clipboard. The factor is NOT active until /auth/mfa/confirm.
+    authMfaEnroll: createEndpoint(
+      `${apiPath}/auth/mfa/enroll`, { method: 'POST' },
+      async (ctx) => {
+        if (!database.mfa) { return mfaUnavailable(); }
+        const me = await currentSession(ctx);
+        if (!me) { return errorResponse(401, 'not authenticated'); }
+        try {
+          const { secret } = await database.mfa.beginEnrollment(me.userId);
+          return json({
+            secret,
+            otpauthUrl: totpUri(secret, { issuer: 'Colyseus Admin', account: me.userId }),
+          });
+        } catch (err: any) {
+          if (err?.message === 'mfa_already_enabled') {
+            return errorResponse(409, 'mfa_already_enabled');
+          }
+          throw err;
+        }
+      },
+    ),
+
+    // POST /admin-api/auth/mfa/confirm — prove the factor with its first
+    // TOTP. Enables MFA and returns the recovery codes (plaintext, shown
+    // once). The session cookie is re-issued with the `mfa` claim — the
+    // operator just proved factor possession, so high-risk actions pass
+    // immediately.
+    authMfaConfirm: createEndpoint(
+      `${apiPath}/auth/mfa/confirm`, { method: 'POST' },
+      async (ctx) => {
+        if (!database.mfa) { return mfaUnavailable(); }
+        const me = await currentSession(ctx);
+        if (!me) { return errorResponse(401, 'not authenticated'); }
+        const body = (ctx.body ?? {}) as { code?: string };
+        if (!body.code) { return errorResponse(400, 'code is required'); }
+
+        const result = await database.mfa.confirmEnrollment(me.userId, body.code.trim());
+        if (result === 'no_enrollment') {
+          return errorResponse(400, 'no pending enrollment — call /auth/mfa/enroll first');
+        }
+        if (result === 'invalid_code') { return errorResponse(400, 'invalid_code'); }
+
+        await tryAuditAuth('auth.mfa_enrolled', me.userId, ctx, {});
+        const role = await database.moderation.getRole(me.userId);
+        const tv = await database.auth.getTokenVersion(me.userId);
+        const token = await signSession({ userId: me.userId, role, tv, mfa: true }, session);
+        return json(
+          { ok: true, recoveryCodes: result.recoveryCodes },
+          { headers: { 'set-cookie': setSessionCookie(token, session) } },
+        );
+      },
+    ),
+
+    // POST /admin-api/auth/mfa/disable — turn MFA off. Requires a valid
+    // current TOTP, so a stolen session cookie alone can't strip the
+    // account's second factor.
+    authMfaDisable: createEndpoint(
+      `${apiPath}/auth/mfa/disable`, { method: 'POST' },
+      async (ctx) => {
+        if (!database.mfa) { return mfaUnavailable(); }
+        const me = await currentSession(ctx);
+        if (!me) { return errorResponse(401, 'not authenticated'); }
+        const body = (ctx.body ?? {}) as { code?: string };
+        if (!body.code) { return errorResponse(400, 'code is required'); }
+
+        let ok = false;
+        try {
+          ok = await database.mfa.verify(me.userId, body.code.trim());
+        } catch (err) {
+          logger?.warn?.({ err }, '[admin] MFA verify failed during disable');
+          return errorResponse(503, 'mfa_unavailable');
+        }
+        if (!ok) {
+          await tryAuditAuth('auth.mfa_failed', me.userId, ctx, { context: 'disable' });
+          return errorResponse(401, 'invalid_code');
+        }
+
+        await database.mfa.disable(me.userId);
+        await tryAuditAuth('auth.mfa_disabled', me.userId, ctx, {});
+        return json({ ok: true });
       },
     ),
 

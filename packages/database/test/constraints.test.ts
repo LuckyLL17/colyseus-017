@@ -84,7 +84,8 @@ function postgresBackend(url: string): Backend {
       const janitor = new GameDatabase({ dialect: 'pg', connectionString: url, migrations: 'skip' });
       await janitor.boot();
       for (const t of ['players', 'colyseus_users', 'colyseus_configs', 'colyseus_cloud_saves', 'colyseus_leaderboards',
-        'colyseus_leaderboard_entries', 'colyseus_analytics_events', 'colyseus_roles', 'colyseus_user_notes', 'colyseus_admin_audit']) {
+        'colyseus_leaderboard_entries', 'colyseus_analytics_events', 'colyseus_roles', 'colyseus_user_notes', 'colyseus_admin_audit',
+        'colyseus_user_mfa', 'colyseus_user_mfa_recovery_codes']) {
         await (janitor as any).rawClient.unsafe(`DROP TABLE IF EXISTS "${t}" CASCADE`);
       }
       await janitor.shutdown();

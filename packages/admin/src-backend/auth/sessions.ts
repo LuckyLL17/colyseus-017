@@ -24,6 +24,13 @@ export interface AdminSession {
    * "sign out everywhere".
    */
   tv?: number;
+  /**
+   * True only when this session was minted AFTER completing the MFA
+   * challenge (or confirming enrollment). High-risk actions gated via
+   * `requireMfaForActions` / `ResourceAction.requiresMfa` read this
+   * claim — a stolen pre-MFA cookie can't satisfy them.
+   */
+  mfa?: boolean;
   /** standard JWT claims */
   iat?: number;
   exp?: number;
@@ -50,7 +57,7 @@ export interface SessionConfig {
 }
 
 export async function signSession(
-  payload: Pick<AdminSession, 'userId' | 'role' | 'tv'>,
+  payload: Pick<AdminSession, 'userId' | 'role' | 'tv' | 'mfa'>,
   config: SessionConfig = {},
 ): Promise<string> {
   const ttl = config.ttlSeconds ?? DEFAULT_TTL_SECONDS;

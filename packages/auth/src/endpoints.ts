@@ -5,6 +5,13 @@ import { z } from 'zod';
 import { JWT } from './JWT.ts';
 import { Hash } from './Hash.ts';
 import { auth, type AuthSettings, type MayHaveUpgradeToken } from './auth.ts';
+import {
+  MFA_CHALLENGE_TTL_SECONDS,
+  mfaChallengeLimiter,
+  signMfaChallenge,
+  verifyMfaChallenge,
+  verifyTOTP,
+} from './mfa.ts';
 import { oauth } from './oauth.ts';
 import { oauthEndpoints } from './oauth-endpoints.ts';
 import { readTemplate } from './templates.ts';
@@ -93,10 +100,155 @@ export function loginEndpoint(prefix: string = auth.prefix) {
             });
           }
         }
+
+        // MFA fork: password is valid, but an enrolled account must still
+        // complete the one-time challenge. We answer 401 `mfa_required`
+        // with a short-lived challenge token instead of a session token —
+        // the "password ok, challenge pending" login state. Accounts
+        // without an MFA record fall through to the legacy token issue.
+        if (auth.settings.onFindMfa && user.id != null) {
+          let mfa: { secret: string } | null | undefined = null;
+          try {
+            mfa = await auth.settings.onFindMfa(user);
+          } catch (lookupError: any) {
+            // Fail open: a broken MFA store (e.g. migration not applied
+            // yet) must not lock every user out. Logged loudly so the
+            // operator notices the downgrade.
+            logger.error('[@colyseus/auth] onFindMfa failed — issuing token without MFA challenge: ' + (lookupError?.message ?? lookupError));
+          }
+          if (mfa) {
+            const mfaToken = await signMfaChallenge({
+              id: user.id,
+              email: ctx.body.email,
+              tv: user.tokenVersion,
+            });
+            throw new APIError(401, {
+              error: 'mfa_required',
+              mfaToken,
+              expiresIn: MFA_CHALLENGE_TTL_SECONDS,
+            });
+          }
+        }
+
         delete user.password;
         return { user, token: await auth.settings.onGenerateToken(user) };
       }
       throw new Error('invalid_credentials');
+    } catch (e: any) {
+      if (e instanceof APIError) { throw e; }
+      logger.error(e);
+      throw new APIError(401, { error: e.message });
+    }
+  });
+}
+
+/**
+ * POST /auth/mfa/verify — complete the one-time challenge issued by
+ * `/auth/login` (401 `mfa_required`). Body: `{ token, code }` where `code`
+ * is either the 6-digit authenticator code or a recovery code.
+ *
+ * Distinct failure states (all 401 unless noted):
+ *   - `mfa_challenge_expired`  — challenge token TTL ran out; log in again.
+ *   - `invalid_challenge`      — malformed, replayed, or orphaned challenge.
+ *   - `session_revoked`        — tokenVersion moved since the challenge was
+ *                                issued (password reset / sign-out-everywhere).
+ *   - `invalid_code`           — wrong TOTP or unknown recovery code.
+ *   - `recovery_code_consumed` — the recovery code was valid once but is spent.
+ *   - 429 `too_many_attempts`  — per-challenge retry cap hit; log in again.
+ */
+export function mfaVerifyEndpoint(prefix: string = auth.prefix) {
+  return createEndpoint(`${prefix}/mfa/verify`, {
+    method: 'POST',
+    body: z.object({
+      token: z.string(),
+      code: z.string(),
+    }),
+  }, async (ctx) => {
+    try {
+      if (typeof auth.settings.onFindMfa !== 'function') {
+        // Login can only have issued a challenge when the hook existed —
+        // reaching here without it means a misconfigured deployment.
+        throw new Error('auth.settings.onFindMfa is not implemented.');
+      }
+
+      const { token, code } = ctx.body;
+
+      const verification = await verifyMfaChallenge(token);
+      if (verification.status === 'expired') {
+        throw new APIError(401, { error: 'mfa_challenge_expired' });
+      } else if (verification.status !== 'ok') {
+        throw new APIError(401, { error: 'invalid_challenge' });
+      }
+      const { claims } = verification;
+
+      // Single-use + per-challenge attempt cap (anti online-brute-force).
+      const limit = mfaChallengeLimiter.check(claims.jti, (claims.exp ?? 0) * 1000);
+      if (limit === 'used') { throw new APIError(401, { error: 'invalid_challenge' }); }
+      if (limit === 'too_many_attempts') { throw new APIError(429, { error: 'too_many_attempts' }); }
+
+      const fail = (error: string, status: 401 | 429 = 401): never => {
+        mfaChallengeLimiter.recordFailure(claims.jti);
+        throw new APIError(status, { error });
+      };
+
+      // "Session revoked" — the user's tokenVersion moved after the
+      // challenge was issued (password reset, sign-out-everywhere, ban).
+      if (claims.tv !== undefined && JWT.settings.revocationCheck) {
+        const valid = await JWT.settings.revocationCheck({ id: claims.id, tokenVersion: claims.tv });
+        if (!valid) { throw new APIError(401, { error: 'session_revoked' }); }
+      }
+
+      // Re-load a fresh user row: the challenge only proves the password
+      // was right a moment ago — ban/MFA state may have moved since.
+      const user: any = Object.assign({}, await auth.settings.onFindUserByEmail(claims.email));
+      if (!user) { fail('invalid_challenge'); }
+
+      if (auth.settings.onCheckBanned) {
+        const banned = await auth.settings.onCheckBanned(user);
+        if (banned) {
+          throw new APIError(403, {
+            error: 'banned',
+            reason: banned.reason ?? null,
+            until: banned.until instanceof Date
+              ? banned.until.toISOString()
+              : banned.until ?? null,
+          });
+        }
+      }
+
+      let mfa: { secret: string } | null | undefined = null;
+      try {
+        mfa = await auth.settings.onFindMfa(user);
+      } catch (lookupError: any) {
+        logger.error('[@colyseus/auth] onFindMfa failed during verify: ' + (lookupError?.message ?? lookupError));
+        throw new APIError(401, { error: 'mfa_unavailable' });
+      }
+
+      // MFA was disabled between challenge and verify — the password check
+      // already passed, so complete the sign-in without a second factor.
+      if (!mfa) {
+        delete user.password;
+        return { user, token: await auth.settings.onGenerateToken(user) };
+      }
+
+      // Route by code shape: 6 digits → authenticator TOTP; anything else
+      // → recovery code. (The two formats can't collide by construction.)
+      let method: 'totp' | 'recovery';
+      const normalized = code.trim();
+      if (/^\d{6}$/.test(normalized)) {
+        if (!verifyTOTP(mfa.secret, normalized)) { fail('invalid_code'); }
+        method = 'totp';
+      } else {
+        if (typeof auth.settings.onConsumeRecoveryCode !== 'function') { fail('invalid_code'); }
+        const status = await auth.settings.onConsumeRecoveryCode(user, normalized);
+        if (status === 'already_consumed') { fail('recovery_code_consumed'); }
+        if (status !== 'ok') { fail('invalid_code'); }
+        method = 'recovery';
+      }
+
+      mfaChallengeLimiter.consume(claims.jti);
+      delete user.password;
+      return { user, token: await auth.settings.onGenerateToken(user), mfa: { method } };
     } catch (e: any) {
       if (e instanceof APIError) { throw e; }
       logger.error(e);
@@ -320,6 +472,7 @@ export function endpoints(opts: EndpointsOptions = {}): Record<string, Endpoint>
   const map: Record<string, Endpoint> = {
     'auth-userdata': userdataEndpoint(prefix),
     'auth-login': loginEndpoint(prefix),
+    'auth-mfa-verify': mfaVerifyEndpoint(prefix),
     'auth-register': registerEndpoint(prefix),
     'auth-anonymous': anonymousEndpoint(prefix),
     'auth-forgot-password': forgotPasswordEndpoint(prefix),

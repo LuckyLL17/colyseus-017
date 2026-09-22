@@ -20,6 +20,31 @@ export type GenerateTokenCallback = (userdata: unknown) => Promise<unknown>;
 export type HashPasswordCallback = (password: string) => Promise<string>;
 
 /**
+ * (Optional) Return the user's ENABLED MFA record — at minimum
+ * `{ secret }` (the TOTP shared secret) — or null/undefined when the
+ * user hasn't enrolled. Returning a record routes the login through the
+ * MFA challenge: `/auth/login` answers 401 `mfa_required` + a short-lived
+ * challenge token instead of a session token, and the client completes
+ * the second factor at `/auth/mfa/verify`.
+ */
+export type FindMfaCallback = (user: unknown) =>
+  Promise<{ secret: string } | null | undefined> | { secret: string } | null | undefined;
+
+/**
+ * Result of consuming a single-use recovery code. The three states are
+ * surfaced as distinct login errors, so implementations must tell
+ * "was valid once" apart from "never existed":
+ *   - 'ok'               — code was valid; now consumed (single-use).
+ *   - 'already_consumed' — code was valid but already spent → 401 `recovery_code_consumed`.
+ *   - 'invalid'          — no such code → 401 `invalid_code` (same as a bad TOTP).
+ * Implementations should consume atomically (a concurrent replay must not
+ * succeed twice).
+ */
+export type RecoveryCodeConsumeStatus = 'ok' | 'already_consumed' | 'invalid';
+export type ConsumeRecoveryCodeCallback = (user: unknown, code: string) =>
+  Promise<RecoveryCodeConsumeStatus> | RecoveryCodeConsumeStatus;
+
+/**
  * Info returned by `onCheckBanned` when the user is banned. Both
  * fields are optional — apps that don't want to expose either keep
  * the field absent in their response.
@@ -57,6 +82,8 @@ export interface AuthSettings {
   onGenerateToken?: GenerateTokenCallback,
   onHashPassword?: HashPasswordCallback,
   onCheckBanned?: CheckBannedCallback,
+  onFindMfa?: FindMfaCallback,
+  onConsumeRecoveryCode?: ConsumeRecoveryCodeCallback,
 };
 
 let onFindUserByEmail: FindUserByEmailCallback = (email: string) => { throw new Error('`auth.settings.onFindUserByEmail` not implemented.'); };
@@ -130,6 +157,17 @@ export const auth = {
      * fresh per-password random salt (stored inline as `<algo>$<salt>$<hash>`).
      */
     onHashPassword,
+
+    /**
+     * (Optional) Look up the user's enabled MFA record. Unset → the login
+     * flow never challenges (legacy behavior for accounts without MFA).
+     */
+    onFindMfa: undefined as FindMfaCallback,
+
+    /**
+     * (Optional) Consume a single-use recovery code during `/auth/mfa/verify`.
+     */
+    onConsumeRecoveryCode: undefined as ConsumeRecoveryCodeCallback,
   } as AuthSettings,
 
   prefix: "/auth",

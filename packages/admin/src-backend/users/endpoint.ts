@@ -26,7 +26,7 @@ import {
 import { listUserSessionsLive } from '@colyseus/core/internal';
 import { errorResponse, json } from '../internal/http.js';
 import { ipFromHeaders } from '../auth/rate-limit.js';
-import { guard, type EndpointContext } from '../internal/context.js';
+import { guard, requireMfa, type EndpointContext } from '../internal/context.js';
 
 const USERS_RESOURCE = 'users';
 
@@ -108,6 +108,13 @@ export function banUserEndpoint(ctx: EndpointContext): Endpoint {
     async (reqCtx) => {
       const denied = await guard(ctx, reqCtx, 'update', USERS_RESOURCE);
       if (denied) { return denied; }
+      // High-risk: banning is the canonical "account takeover" action —
+      // when the deployment opted into requireMfaForActions, the session
+      // must have completed MFA.
+      if (ctx.requireMfaForActions) {
+        const mfaDenied = await requireMfa(ctx, reqCtx);
+        if (mfaDenied) { return mfaDenied; }
+      }
       const { userId } = reqCtx.params as { userId: string };
       const body = (reqCtx.body as { reason?: unknown; until?: unknown } | null) ?? {};
 
@@ -195,6 +202,12 @@ export function revokeSessionsEndpoint(ctx: EndpointContext): Endpoint {
     async (reqCtx) => {
       const denied = await guard(ctx, reqCtx, 'update', USERS_RESOURCE);
       if (denied) { return denied; }
+      // High-risk: mass session revocation is the other account-takeover
+      // primitive — same MFA gate as ban when the deployment opted in.
+      if (ctx.requireMfaForActions) {
+        const mfaDenied = await requireMfa(ctx, reqCtx);
+        if (mfaDenied) { return mfaDenied; }
+      }
       const { userId } = reqCtx.params as { userId: string };
       try {
         await ctx.database.auth.bumpTokenVersion(userId);

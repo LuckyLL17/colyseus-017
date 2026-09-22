@@ -2,6 +2,7 @@ import { eq, sql, type InferSelectModel } from 'drizzle-orm';
 import { generateId } from '@colyseus/core';
 import type { AuthSettings } from '@colyseus/auth';
 import type { UsersTableShape } from '../types.ts';
+import type { MfaService } from './MfaService.ts';
 import type { ServiceDb } from './_db.ts';
 
 /**
@@ -15,10 +16,12 @@ import type { ServiceDb } from './_db.ts';
 export class AuthService<T extends UsersTableShape = UsersTableShape> {
   private db: ServiceDb;
   private users: T;
+  private mfa: MfaService<any, any> | undefined;
 
-  constructor(db: ServiceDb, users: T) {
+  constructor(db: ServiceDb, users: T, mfa?: MfaService<any, any>) {
     this.db = db;
     this.users = users;
+    this.mfa = mfa;
   }
 
   /**
@@ -35,6 +38,19 @@ export class AuthService<T extends UsersTableShape = UsersTableShape> {
       onResetPassword: this.resetPassword.bind(this),
       onOAuthProviderCallback: this.oauthCallback.bind(this),
       onCheckBanned: this.checkBanned.bind(this),
+      // MFA hooks — only returned when the MfaService is wired (always,
+      // for GameDatabase-booted instances). Users without an enrollment
+      // row get `null` here, so legacy accounts keep the original
+      // password-only login flow untouched.
+      onFindMfa: async (user: any) => {
+        if (!this.mfa) { return null; }
+        const record = await this.mfa.getRecord(user.id);
+        return record?.enabledAt ? { secret: record.secret } : null;
+      },
+      onConsumeRecoveryCode: async (user: any, code: string) => {
+        if (!this.mfa) { return 'invalid' as const; }
+        return this.mfa.consumeRecoveryCode(user.id, code);
+      },
     };
   }
 

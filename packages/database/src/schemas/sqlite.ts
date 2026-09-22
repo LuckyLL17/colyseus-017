@@ -137,6 +137,36 @@ export const userNoteColumns = {
     .$defaultFn(() => new Date()),
 };
 
+/**
+ * Per-user MFA enrollment (one row per user). `secret` is the TOTP shared
+ * secret — present from the moment enrollment begins; `enabledAt` flips
+ * non-null only after the user proves the factor with a valid first code,
+ * so a half-finished enrollment never triggers the login challenge.
+ *
+ * Absence of a row (or a null `enabledAt`) means "legacy account, no MFA"
+ * — the login flow skips the challenge entirely.
+ */
+export const userMfaColumns = {
+  userId: text('user_id').primaryKey(),
+  secret: text('secret').notNull(),
+  enabledAt: integer('enabled_at', { mode: 'timestamp' as const }),
+  createdAt: integer('created_at', { mode: 'timestamp' as const }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' as const }).notNull().default(sql`(unixepoch())`),
+};
+
+/**
+ * Single-use MFA recovery codes. Only the SHA-256 hash is stored — the
+ * plaintext is shown to the user exactly once at enrollment. `consumedAt`
+ * flips atomically (UPDATE … WHERE consumed_at IS NULL) so a replayed
+ * code is rejected as `already_consumed` instead of silently re-usable.
+ */
+export const userMfaRecoveryCodeColumns = {
+  userId: text('user_id').notNull(),
+  codeHash: text('code_hash').notNull(),
+  consumedAt: integer('consumed_at', { mode: 'timestamp' as const }),
+  createdAt: integer('created_at', { mode: 'timestamp' as const }).notNull().default(sql`(unixepoch())`),
+};
+
 // ---------------------------------------------------------------------------
 // Default table instances — used when the user does NOT provide custom schemas
 // ---------------------------------------------------------------------------
@@ -164,6 +194,14 @@ export const colyseusRoles = sqliteTable('colyseus_roles', { ...roleColumns });
 export const colyseusUserNotes = sqliteTable('colyseus_user_notes', { ...userNoteColumns });
 
 export const colyseusAdminAudit = sqliteTable('colyseus_admin_audit', { ...adminAuditColumns });
+
+export const colyseusUserMfa = sqliteTable('colyseus_user_mfa', { ...userMfaColumns });
+
+export const colyseusUserMfaRecoveryCodes = sqliteTable(
+  'colyseus_user_mfa_recovery_codes',
+  { ...userMfaRecoveryCodeColumns },
+  (table) => [primaryKey({ columns: [table.userId, table.codeHash] })],
+);
 
 /**
  * Matchmaking room cache — sqlite twin of pg's `roomCacheColumns`. See the
@@ -204,4 +242,6 @@ export const SQLITE_TABLES: ReadonlyArray<TableEntry> = [
   { key: 'roles',              table: colyseusRoles,              columns: roleColumns,            dependsOn: ['users'] },
   { key: 'userNotes',          table: colyseusUserNotes,          columns: userNoteColumns,        dependsOn: ['users'] },
   { key: 'adminAudit',         table: colyseusAdminAudit,         columns: adminAuditColumns,      dependsOn: [] },
+  { key: 'userMfa',            table: colyseusUserMfa,            columns: userMfaColumns,         dependsOn: ['users'] },
+  { key: 'userMfaRecoveryCodes', table: colyseusUserMfaRecoveryCodes, columns: userMfaRecoveryCodeColumns, dependsOn: ['userMfa'] },
 ];

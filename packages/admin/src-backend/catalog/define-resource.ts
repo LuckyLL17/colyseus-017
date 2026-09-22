@@ -22,6 +22,14 @@ export interface ResourceAction {
   /** If true, requires a row id; UI shows it as a row-level action. */
   perRow?: boolean;
   /**
+   * If true, the action only runs for sessions that completed MFA (the
+   * admin session JWT carries the `mfa` claim). Declare on high-risk
+   * actions — payouts, bulk deletes, permission grants — so a stolen
+   * session cookie alone can't invoke them. Unauthenticated requests
+   * are still rejected by the RBAC layer first.
+   */
+  requiresMfa?: boolean;
+  /**
    * If set, the UI prompts before invoking the action. Use for destructive
    * or expensive operations (refunds, bans, item revokes).
    */

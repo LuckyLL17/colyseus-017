@@ -2,6 +2,7 @@ import type { DatabaseSyncOptions } from 'node:sqlite';
 import type { Presence } from '@colyseus/core';
 import { generateCreateTableSQL, generateCreateIndexSQL, generateAlterAddColumnSQL } from './utils.ts';
 import { AuthService } from './services/AuthService.ts';
+import { MfaService } from './services/MfaService.ts';
 import { ConfigService } from './services/ConfigService.ts';
 import { CloudSaveService } from './services/CloudSaveService.ts';
 import { LeaderboardsService } from './services/LeaderboardsService.ts';
@@ -286,6 +287,12 @@ export class GameDatabase<
   C extends ConfigsRegistry = {},
 > {
   auth: AuthService<Resolve<S, 'users'>>;
+  /**
+   * One-time MFA (TOTP enrollment + single-use recovery codes). Wired into
+   * `auth.settings` automatically — users without an enrollment row keep
+   * the legacy password-only login.
+   */
+  mfa: MfaService<Resolve<S, 'userMfa'>, Resolve<S, 'userMfaRecoveryCodes'>>;
   configs: ConfigService<Resolve<S, 'configs'>, C>;
   saves: CloudSaveService<Resolve<S, 'cloudSaves'>>;
   leaderboards: LeaderboardsService<Resolve<S, 'leaderboards'>, Resolve<S, 'leaderboardEntries'>>;
@@ -444,7 +451,8 @@ export class GameDatabase<
     }
 
     // 4. Instantiate services
-    this.auth = new AuthService(this.drizzle, schemas.users);
+    this.mfa = new MfaService(this.drizzle, schemas.userMfa, schemas.userMfaRecoveryCodes);
+    this.auth = new AuthService(this.drizzle, schemas.users, this.mfa);
     this.configs = new ConfigService(this.drizzle, schemas.configs, {
       registry: this.options.configsRegistry,
       presence: this.options.presence,

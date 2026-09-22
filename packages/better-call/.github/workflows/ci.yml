@@ -1,0 +1,52 @@
+name: CI
+
+on: 
+    pull_request:  
+        branches: main
+    push: 
+        branches: main
+    merge_group: {}
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                    fetch-depth: 0
+
+            - uses: pnpm/action-setup@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 20.x
+                registry-url: 'https://registry.npmjs.org'
+                cache: pnpm
+            
+            - name: Install
+              run: pnpm install
+
+            - name: Build
+              run: pnpm build
+            
+            - name: Lint
+              run: pnpm lint
+
+            - name: Lint dependencies
+              run: pnpm lint:dependencies
+
+            - name: Lint package
+              run: pnpm lint:packages
+
+            - name: Lint types
+              run: pnpm lint:types
+
+            - name: Lint spell
+              run: pnpm lint:spell
+            
+            - name: Test
+              run: pnpm coverage
+
+            - name: Typecheck
+              run: pnpm typecheck
+            

@@ -181,7 +181,20 @@ export interface AdminOptions {
     bootstrap?: RateLimiter | false;
     /** Per-(ip, email) limit on /auth/request-reset. Default ~1/min. */
     requestReset?: RateLimiter | false;
+    /** Per-ip limit on /auth/mfa/verify. Default ~10/min. */
+    mfa?: RateLimiter | false;
   };
+
+  /**
+   * When true, the built-in high-risk actions (ban user, revoke sessions)
+   * require a session that completed MFA — the login challenge at
+   * /admin-api/auth/mfa/verify, or enrollment confirmation. Sessions
+   * without the `mfa` claim get 403 `mfa_required`. Custom resource
+   * actions opt in individually via `requiresMfa: true` regardless of
+   * this flag. Default false (opt-in — enabling it without giving
+   * operators an enrollment path would lock the actions out).
+   */
+  requireMfaForActions?: boolean;
 
   /**
    * Dashboard customization for the admin home page.
@@ -330,6 +343,58 @@ function applyBuiltInResourceDefaults(
         target_id:   { label: 'Target', linkTo: { resourceFromColumn: 'resource' } },
       },
     }),
+    // MFA enrollments. The TOTP `secret` must never render in the UI —
+    // list/show project it away. Writes go through the MFA endpoints
+    // (enroll/confirm/disable), which is why create/update are denied
+    // for everyone. Delete stays allowed for admins: it's the "operator
+    // resets a locked-out user's MFA" recovery path, and it's audited
+    // like every other CRUD delete.
+    userMfa: () => ({
+      label: 'MFA enrollments',
+      icon: 'safety',
+      policies: {
+        list:   ['admin'],
+        read:   ['admin'],
+        create: 'deny',
+        update: 'deny',
+      },
+      list: {
+        columns: ['user_id', 'enabled_at', 'created_at', 'updated_at'],
+        defaultSort: { field: 'updated_at', order: 'desc' },
+      },
+      show: {
+        fields: ['user_id', 'enabled_at', 'created_at', 'updated_at'],
+      },
+      columns: {
+        user_id:    { label: 'User', linkTo: { resource: 'users' } },
+        enabled_at: { label: 'Enabled' },
+      },
+    }),
+    // Recovery-code rows only ever carry hashes, but there's still no
+    // legitimate reason to browse or mutate them from the panel —
+    // consumption happens in the login challenge, regeneration in the
+    // MFA endpoints. Fully read-only, admin-only, hash projected away.
+    userMfaRecoveryCodes: () => ({
+      label: 'MFA recovery codes',
+      icon: 'key',
+      policies: {
+        list:   ['admin'],
+        read:   ['admin'],
+        create: 'deny',
+        update: 'deny',
+        delete: 'deny',
+      },
+      list: {
+        columns: ['user_id', 'consumed_at', 'created_at'],
+        defaultSort: { field: 'created_at', order: 'desc' },
+      },
+      show: {
+        fields: ['user_id', 'consumed_at', 'created_at'],
+      },
+      columns: {
+        user_id: { label: 'User', linkTo: { resource: 'users' } },
+      },
+    }),
   };
   for (const [canonical, factory] of Object.entries(builtIns)) {
     if (!tables[canonical]) { continue; }   // not on this database
@@ -381,6 +446,7 @@ function buildContext(opts: AdminOptions): EndpointContext {
   const allowDevHeader = opts.allowDevHeader ?? (process.env.NODE_ENV !== 'production');
   const resolveUserId = opts.resolveUserId ?? makeDefaultResolver(allowDevHeader, database);
   const enforceRbac = opts.enforceRbac !== false;
+  const requireMfaForActions = opts.requireMfaForActions ?? false;
   const logger = opts.logger === null ? null : (opts.logger ?? defaultLogger);
 
   const resolvedTables = opts.tables ?? database.tables;
@@ -426,7 +492,7 @@ function buildContext(opts: AdminOptions): EndpointContext {
   return {
     apiPath, uiPath, uiDistDir,
     database, tables, resources,
-    getTableConfig, resolveUserId, enforceRbac, logger,
+    getTableConfig, resolveUserId, enforceRbac, requireMfaForActions, logger,
   };
 }
 
@@ -465,6 +531,9 @@ function adminImpl(opts: AdminOptions) {
   const requestResetLimiter = resolveLimiter(opts.rateLimit?.requestReset, {
     capacity: 3, refillPerSec: 1 / 60, retryAfterSec: 60,
   });
+  const mfaLimiter = resolveLimiter(opts.rateLimit?.mfa, {
+    capacity: 10, refillPerSec: 1 / 6, retryAfterSec: 6,
+  });
 
   // Auth endpoints (login/logout/bootstrap/me/status). Spread alongside the
   // CRUD endpoints so consumers get one map to spread into createRouter.
@@ -476,6 +545,7 @@ function adminImpl(opts: AdminOptions) {
     loginLimiter,
     bootstrapLimiter,
     requestResetLimiter,
+    mfaLimiter,
     minPasswordLength: opts.minPasswordLength ?? 8,
     onResetRequest: opts.onResetRequest,
     logger: ctx.logger,

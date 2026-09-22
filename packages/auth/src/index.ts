@@ -9,7 +9,10 @@ import {
   type FindUserByEmailCallback,
   type ParseTokenCallback,
   type GenerateTokenCallback,
-  type HashPasswordCallback
+  type HashPasswordCallback,
+  type FindMfaCallback,
+  type ConsumeRecoveryCodeCallback,
+  type RecoveryCodeConsumeStatus,
 } from './auth.ts';
 
 import type { OAuthProviderCallback } from './oauth.ts';
@@ -24,11 +27,37 @@ export type {
   ParseTokenCallback,
   GenerateTokenCallback,
   HashPasswordCallback,
+  FindMfaCallback,
+  ConsumeRecoveryCodeCallback,
+  RecoveryCodeConsumeStatus,
 
   OAuthProviderCallback,
 };
 
 export { Hash, JWT, auth, };
+
+// One-time MFA (TOTP + recovery codes + login-challenge tokens). Storage
+// hooks are `auth.settings.onFindMfa` / `onConsumeRecoveryCode`; these
+// helpers power the challenge flow and any custom enrollment endpoints.
+export {
+  generateMfaSecret,
+  totp,
+  verifyTOTP,
+  totpUri,
+  generateRecoveryCodes,
+  normalizeRecoveryCode,
+  hashRecoveryCode,
+  signMfaChallenge,
+  verifyMfaChallenge,
+  mfaChallengeLimiter,
+  MfaChallengeLimiter,
+  MFA_CHALLENGE_TTL_SECONDS,
+  RECOVERY_CODE_COUNT,
+  TOTP_PERIOD_SECONDS,
+  type MfaChallengeClaims,
+  type MfaChallengeVerification,
+  type MfaChallengeLimitStatus,
+} from './mfa.ts';
 
 // Email/page HTML template loader — exported so @colyseus/admin (and
 // custom flows) can reuse the same resolver + consumer-override
@@ -40,6 +69,7 @@ export { readTemplate, htmlTemplatePath } from './templates.ts';
 export {
   userdataEndpoint,
   loginEndpoint,
+  mfaVerifyEndpoint,
   registerEndpoint,
   anonymousEndpoint,
   forgotPasswordEndpoint,

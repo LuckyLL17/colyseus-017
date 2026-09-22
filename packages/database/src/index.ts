@@ -19,6 +19,8 @@ export type { LeaderboardEntry } from './services/LeaderboardsService.ts';
 export type { Role, Action } from './services/ModerationService.ts';
 export { diffRows } from './services/AuditService.ts';
 export type { AuditEntry, AuditAction } from './services/AuditService.ts';
+export { MfaService } from './services/MfaService.ts';
+export type { MfaRecord, MfaConfirmResult } from './services/MfaService.ts';
 export { defineSegment, createSegmentDefiner } from './segments.ts';
 export type { RelationDefinition, RelationKind } from './relations-meta.ts';
 export { resolveFkLayout } from './relations-meta.ts';
@@ -41,6 +43,8 @@ export {
   roleColumns as sqliteRoleColumns,
   userNoteColumns as sqliteUserNoteColumns,
   adminAuditColumns as sqliteAdminAuditColumns,
+  userMfaColumns as sqliteUserMfaColumns,
+  userMfaRecoveryCodeColumns as sqliteUserMfaRecoveryCodeColumns,
   roomCacheColumns as sqliteRoomCacheColumns,
 } from './schemas/sqlite.ts';
 export {
@@ -53,6 +57,8 @@ export {
   roleColumns as pgRoleColumns,
   userNoteColumns as pgUserNoteColumns,
   adminAuditColumns as pgAdminAuditColumns,
+  userMfaColumns as pgUserMfaColumns,
+  userMfaRecoveryCodeColumns as pgUserMfaRecoveryCodeColumns,
   roomCacheColumns as pgRoomCacheColumns,
 } from './schemas/pg.ts';
 

@@ -1,0 +1,12 @@
+packages:
+  - packages/**
+  - example
+
+blockExoticSubdeps: true
+
+onlyBuiltDependencies:
+  - esbuild
+
+trustPolicy: no-downgrade
+
+trustPolicyIgnoreAfter: 43200

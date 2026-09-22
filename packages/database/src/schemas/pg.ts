@@ -115,6 +115,30 @@ export const userNoteColumns = {
   createdAt: timestamp('created_at').notNull().defaultNow(),
 };
 
+/**
+ * Per-user MFA enrollment — see schemas/sqlite.ts for the design. `secret`
+ * exists from enrollment start; `enabledAt` flips non-null only after the
+ * first valid TOTP, so half-finished enrollments never gate logins.
+ */
+export const userMfaColumns = {
+  userId: text('user_id').primaryKey(),
+  secret: text('secret').notNull(),
+  enabledAt: timestamp('enabled_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+};
+
+/**
+ * Single-use MFA recovery codes (SHA-256 hashes only) — see
+ * schemas/sqlite.ts for the design.
+ */
+export const userMfaRecoveryCodeColumns = {
+  userId: text('user_id').notNull(),
+  codeHash: text('code_hash').notNull(),
+  consumedAt: timestamp('consumed_at'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+};
+
 // ---------------------------------------------------------------------------
 // Default table instances — used when the user does NOT provide custom schemas
 // ---------------------------------------------------------------------------
@@ -142,6 +166,14 @@ export const colyseusRoles = pgTable('colyseus_roles', { ...roleColumns });
 export const colyseusUserNotes = pgTable('colyseus_user_notes', { ...userNoteColumns });
 
 export const colyseusAdminAudit = pgTable('colyseus_admin_audit', { ...adminAuditColumns });
+
+export const colyseusUserMfa = pgTable('colyseus_user_mfa', { ...userMfaColumns });
+
+export const colyseusUserMfaRecoveryCodes = pgTable(
+  'colyseus_user_mfa_recovery_codes',
+  { ...userMfaRecoveryCodeColumns },
+  (table) => [primaryKey({ columns: [table.userId, table.codeHash] })],
+);
 
 /**
  * Matchmaking room cache. Used by the `@colyseus/database/driver`
@@ -183,4 +215,6 @@ export const PG_TABLES: ReadonlyArray<TableEntry> = [
   { key: 'roles',              table: colyseusRoles,              columns: roleColumns,            dependsOn: ['users'] },
   { key: 'userNotes',          table: colyseusUserNotes,          columns: userNoteColumns,        dependsOn: ['users'] },
   { key: 'adminAudit',         table: colyseusAdminAudit,         columns: adminAuditColumns,      dependsOn: [] },
+  { key: 'userMfa',            table: colyseusUserMfa,            columns: userMfaColumns,         dependsOn: ['users'] },
+  { key: 'userMfaRecoveryCodes', table: colyseusUserMfaRecoveryCodes, columns: userMfaRecoveryCodeColumns, dependsOn: ['userMfa'] },
 ];
